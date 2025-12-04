@@ -53,6 +53,8 @@ struct BodyFileStart {
 
 struct BodyFileData {
   int sequence_;
+  int data_length_;
+  char data_[];
 };
 
 #pragma pack(pop)
