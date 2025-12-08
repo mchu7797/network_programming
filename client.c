@@ -1,162 +1,296 @@
-#include "client.h"
 #include <arpa/inet.h>
+#include <libgen.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-// 전역 변수
+#include "client.h"
+
 int sock;
 char myUsername[NAME_LENGTH];
 pthread_mutex_t sockMutex = PTHREAD_MUTEX_INITIALIZER;
+DownloadSession downloadSession = {0};
+pthread_mutex_t downloadMutex = PTHREAD_MUTEX_INITIALIZER;
 
-int main(int argc, char *argv[]) {
-  struct sockaddr_in servAddr;
-  pthread_t recvThread;
-  char input[BUF_SIZE];
-
-  if (argc != 3) {
-    printf("사용법: %s <IP> <Port>\n", argv[0]);
-    exit(1);
+int recvAll(int sock, void *buffer, int length) {
+  int total = 0;
+  char *ptr = buffer;
+  while (total < length) {
+    int n = recv(sock, ptr + total, length - total, 0);
+    if (n <= 0) return n;
+    total += n;
   }
-
-  // 소켓 생성
-  sock = socket(PF_INET, SOCK_STREAM, 0);
-  if (sock == -1) {
-    perror("socket() error");
-    exit(1);
-  }
-
-  // 서버 주소 설정
-  memset(&servAddr, 0, sizeof(servAddr));
-  servAddr.sin_family = AF_INET;
-  servAddr.sin_addr.s_addr = inet_addr(argv[1]);
-  servAddr.sin_port = htons(atoi(argv[2]));
-
-  // 서버 연결
-  if (connect(sock, (struct sockaddr *)&servAddr, sizeof(servAddr)) == -1) {
-    perror("connect() error");
-    close(sock);
-    exit(1);
-  }
-
-  printf("=== 채팅 서버에 연결되었습니다 ===\n");
-
-  // 사용자명 입력
-  printf("사용자명을 입력하세요: ");
-  fgets(myUsername, NAME_LENGTH, stdin);
-  myUsername[strcspn(myUsername, "\n")] = '\0';
-
-  // JOIN 패킷 전송
-  sendJoin(myUsername);
-
-  // 수신 스레드 생성
-  if (pthread_create(&recvThread, NULL, receiveThread, NULL) != 0) {
-    perror("pthread_create() error");
-    close(sock);
-    exit(1);
-  }
-  pthread_detach(recvThread);
-
-  printf("\n명령어:\n");
-  printf("  /help     - 도움말\n");
-  printf("  /list     - 접속자 목록\n");
-  printf("  /w <name> <msg> - 귓속말\n");
-  printf("  /quit     - 종료\n");
-  printf("  (일반 메시지는 그냥 입력)\n\n");
-
-  // 메시지 입력 루프
-  while (1) {
-    printf("> ");
-    fflush(stdout);
-
-    if (fgets(input, BUF_SIZE, stdin) == NULL) {
-      break;
-    }
-
-    // 개행 제거
-    input[strcspn(input, "\n")] = '\0';
-
-    // 빈 입력 무시
-    if (strlen(input) == 0) {
-      continue;
-    }
-
-    // 명령어 처리
-    if (strcmp(input, "/quit") == 0) {
-      sendQuit();
-      break;
-    } else if (strcmp(input, "/help") == 0) {
-      printHelp();
-    } else if (strcmp(input, "/list") == 0) {
-      sendListOnline();
-    } else if (strncmp(input, "/w ", 3) == 0) {
-      // 귓속말 파싱: /w <target> <message>
-      char *target = strtok(input + 3, " ");
-      char *message = strtok(NULL, "");
-
-      if (target && message) {
-        sendWhisper(target, message);
-      } else {
-        printf("사용법: /w <사용자명> <메시지>\n");
-      }
-    } else {
-      // 일반 채팅
-      sendChat(input);
-    }
-  }
-
-  close(sock);
-  printf("연결이 종료되었습니다.\n");
-  return 0;
+  return total;
 }
 
-// 메시지 수신 스레드
+int sendAll(int sock, void *buffer, int length) {
+  pthread_mutex_lock(&sockMutex);
+  int total = 0;
+  char *ptr = buffer;
+  while (total < length) {
+    int n = send(sock, ptr + total, length - total, MSG_NOSIGNAL);
+    if (n <= 0) {
+      pthread_mutex_unlock(&sockMutex);
+      return n;
+    }
+    total += n;
+  }
+  pthread_mutex_unlock(&sockMutex);
+  return total;
+}
+
+void sendJoin(const char *username) {
+  int len = sizeof(struct PacketHeader) + sizeof(struct BodyJoin);
+  char *pkt = malloc(len);
+  struct PacketHeader *h = (struct PacketHeader *)pkt;
+  h->action_ = PROTOCOL_ACTION_JOIN;
+  h->body_length_ = sizeof(struct BodyJoin);
+  struct BodyJoin *b = (struct BodyJoin *)(pkt + sizeof(struct PacketHeader));
+  strncpy(b->username_, username, NAME_LENGTH - 1);
+  b->username_[NAME_LENGTH - 1] = '\0';
+  sendAll(sock, pkt, len);
+  free(pkt);
+}
+
+void sendChat(const char *message) {
+  int msg_len = strlen(message) + 1;
+  int len = sizeof(struct PacketHeader) + sizeof(struct BodyChat) + msg_len;
+  char *pkt = malloc(len);
+  struct PacketHeader *h = (struct PacketHeader *)pkt;
+  h->action_ = PROTOCOL_ACTION_CHAT;
+  h->body_length_ = sizeof(struct BodyChat) + msg_len;
+  struct BodyChat *b = (struct BodyChat *)(pkt + sizeof(struct PacketHeader));
+  strncpy(b->sender_, myUsername, NAME_LENGTH - 1);
+  b->sender_[NAME_LENGTH - 1] = '\0';
+  strcpy(pkt + sizeof(struct PacketHeader) + sizeof(struct BodyChat), message);
+  sendAll(sock, pkt, len);
+  free(pkt);
+}
+
+void sendWhisper(const char *target, const char *message) {
+  int msg_len = strlen(message) + 1;
+  int len = sizeof(struct PacketHeader) + sizeof(struct BodyWhisper) + msg_len;
+  char *pkt = malloc(len);
+  struct PacketHeader *h = (struct PacketHeader *)pkt;
+  h->action_ = PROTOCOL_ACTION_WHISPER;
+  h->body_length_ = sizeof(struct BodyWhisper) + msg_len;
+  struct BodyWhisper *b = (struct BodyWhisper *)(pkt + sizeof(struct PacketHeader));
+  strncpy(b->sender_, myUsername, NAME_LENGTH - 1);
+  b->sender_[NAME_LENGTH - 1] = '\0';
+  strncpy(b->target_, target, NAME_LENGTH - 1);
+  b->target_[NAME_LENGTH - 1] = '\0';
+  strcpy(pkt + sizeof(struct PacketHeader) + sizeof(struct BodyWhisper), message);
+  sendAll(sock, pkt, len);
+  free(pkt);
+}
+
+void sendListOnline(void) {
+  struct PacketHeader h;
+  h.action_ = PROTOCOL_ACTION_LIST_ONLINE;
+  h.body_length_ = 0;
+  sendAll(sock, &h, sizeof(h));
+}
+
+void sendQuit(void) {
+  struct PacketHeader h;
+  h.action_ = PROTOCOL_ACTION_QUIT;
+  h.body_length_ = 0;
+  sendAll(sock, &h, sizeof(h));
+}
+
+void sendListFile(void) {
+  struct PacketHeader h;
+  h.action_ = PROTOCOL_ACTION_LIST_FILE;
+  h.body_length_ = 0;
+  sendAll(sock, &h, sizeof(h));
+}
+
+void sendFileUpload(const char *filepath) {
+  FILE *fp = fopen(filepath, "rb");
+  if (!fp) {
+    printf("Cannot open file: %s\n", filepath);
+    return;
+  }
+
+  fseek(fp, 0, SEEK_END);
+  long long filesize = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+
+  if (filesize > MAX_FILE_SIZE) {
+    printf("File too large (max %dMB)\n", MAX_FILE_SIZE / 1024 / 1024);
+    fclose(fp);
+    return;
+  }
+  if (filesize == 0) {
+    printf("Cannot upload empty file\n");
+    fclose(fp);
+    return;
+  }
+
+  char path_copy[512];
+  strncpy(path_copy, filepath, sizeof(path_copy) - 1);
+  char *filename = basename(path_copy);
+  printf("Upload started: %s (%lld bytes)\n", filename, filesize);
+
+  int start_len = sizeof(struct PacketHeader) + sizeof(struct BodyFileStart);
+  char *start_pkt = calloc(1, start_len);
+  struct PacketHeader *sh = (struct PacketHeader *)start_pkt;
+  sh->action_ = PROTOCOL_ACTION_FILE_START;
+  sh->body_length_ = sizeof(struct BodyFileStart);
+  struct BodyFileStart *sb = (struct BodyFileStart *)(start_pkt + sizeof(struct PacketHeader));
+  strncpy(sb->sender_, myUsername, NAME_LENGTH - 1);
+  strncpy(sb->filename_, filename, FILE_NAME_LENGTH - 1);
+  sb->filesize_ = filesize;
+  sendAll(sock, start_pkt, start_len);
+  free(start_pkt);
+
+  char buf[CHUNK_SIZE];
+  int seq = 0;
+  size_t n;
+  long long total_sent = 0;
+
+  while ((n = fread(buf, 1, CHUNK_SIZE, fp)) > 0) {
+    int len = sizeof(struct PacketHeader) + sizeof(struct BodyFileData) + n;
+    char *pkt = malloc(len);
+    struct PacketHeader *h = (struct PacketHeader *)pkt;
+    h->action_ = PROTOCOL_ACTION_FILE_DATA;
+    h->body_length_ = sizeof(struct BodyFileData) + n;
+    struct BodyFileData *b = (struct BodyFileData *)(pkt + sizeof(struct PacketHeader));
+    b->sequence_ = seq++;
+    b->data_length_ = n;
+    memcpy(pkt + sizeof(struct PacketHeader) + sizeof(struct BodyFileData), buf, n);
+    sendAll(sock, pkt, len);
+    free(pkt);
+    total_sent += n;
+  }
+
+  fclose(fp);
+  printf("Upload sent: %s (%lld bytes)\n", filename, total_sent);
+}
+
+void sendFileRequest(const char *filename) {
+  pthread_mutex_lock(&downloadMutex);
+  if (downloadSession.active) {
+    pthread_mutex_unlock(&downloadMutex);
+    printf("Download already in progress\n");
+    return;
+  }
+  pthread_mutex_unlock(&downloadMutex);
+
+  int len = sizeof(struct PacketHeader) + sizeof(struct BodyRequestFile);
+  char *pkt = malloc(len);
+  struct PacketHeader *h = (struct PacketHeader *)pkt;
+  h->action_ = PROTOCOL_ACTION_REQUEST_FILE;
+  h->body_length_ = sizeof(struct BodyRequestFile);
+  struct BodyRequestFile *b = (struct BodyRequestFile *)(pkt + sizeof(struct PacketHeader));
+  strncpy(b->filename_, filename, FILE_NAME_LENGTH - 1);
+  b->filename_[FILE_NAME_LENGTH - 1] = '\0';
+  sendAll(sock, pkt, len);
+  free(pkt);
+  printf("Download requested: %s\n", filename);
+}
+
+void handleFileStart(struct BodyFileStart *body) {
+  pthread_mutex_lock(&downloadMutex);
+  if (downloadSession.active) {
+    pthread_mutex_unlock(&downloadMutex);
+    printf("\nDownload already in progress\n> ");
+    fflush(stdout);
+    return;
+  }
+
+  char filepath[512];
+  snprintf(filepath, sizeof(filepath), "%s%s", DOWNLOAD_DIR, body->filename_);
+  downloadSession.fp = fopen(filepath, "wb");
+  if (!downloadSession.fp) {
+    pthread_mutex_unlock(&downloadMutex);
+    printf("\nCannot create file: %s\n> ", filepath);
+    fflush(stdout);
+    return;
+  }
+
+  downloadSession.active = 1;
+  strncpy(downloadSession.filename, body->filename_, FILE_NAME_LENGTH - 1);
+  downloadSession.total_size = body->filesize_;
+  downloadSession.received = 0;
+  pthread_mutex_unlock(&downloadMutex);
+  printf("\nDownload started: %s (%lld bytes)\n> ", body->filename_, body->filesize_);
+  fflush(stdout);
+}
+
+void handleFileData(struct BodyFileData *body, int data_len) {
+  pthread_mutex_lock(&downloadMutex);
+  if (!downloadSession.active || !downloadSession.fp) {
+    pthread_mutex_unlock(&downloadMutex);
+    return;
+  }
+
+  char *data = (char *)body + sizeof(struct BodyFileData);
+  fwrite(data, 1, data_len, downloadSession.fp);
+  downloadSession.received += data_len;
+
+  if (downloadSession.received >= downloadSession.total_size) {
+    fclose(downloadSession.fp);
+    downloadSession.fp = NULL;
+    printf("\nDownload complete: %s (%lld bytes)\n> ",
+           downloadSession.filename, downloadSession.received);
+    fflush(stdout);
+    downloadSession.active = 0;
+  }
+  pthread_mutex_unlock(&downloadMutex);
+}
+
 void *receiveThread(void *arg) {
+  (void)arg;
   struct PacketHeader header;
   char *body = NULL;
 
   while (1) {
-    // 1. 헤더 수신
-    if (recvAll(sock, &header, sizeof(struct PacketHeader)) <= 0) {
-      printf("\n서버와의 연결이 끊어졌습니다.\n");
+    if (recvAll(sock, &header, sizeof(header)) <= 0) {
+      printf("\nDisconnected from server\n");
       exit(0);
     }
 
-    // 2. 바디 수신
     if (header.body_length_ > 0) {
-      body = (char *)malloc(header.body_length_);
+      body = malloc(header.body_length_);
       if (recvAll(sock, body, header.body_length_) <= 0) {
         free(body);
-        printf("\n서버와의 연결이 끊어졌습니다.\n");
+        printf("\nDisconnected from server\n");
         exit(0);
       }
     }
 
-    // 3. 액션별 처리
     switch (header.action_) {
-    case PROTOCOL_ACTION_CHAT: {
+    case PROTOCOL_ACTION_CHAT:
       if (body) {
-        struct BodyChat *chat = (struct BodyChat *)body;
-        char *message = body + sizeof(struct BodyChat);
-        printf("\n[%s] %s\n> ", chat->sender_, message);
+        struct BodyChat *c = (struct BodyChat *)body;
+        char *msg = body + sizeof(struct BodyChat);
+        printf("\n[%s] %s\n> ", c->sender_, msg);
         fflush(stdout);
       }
       break;
-    }
-
-    case PROTOCOL_ACTION_WHISPER: {
+    case PROTOCOL_ACTION_WHISPER:
       if (body) {
-        struct BodyWhisper *whisper = (struct BodyWhisper *)body;
-        char *message = body + sizeof(struct BodyWhisper);
-        printf("\n[귓속말 from %s] %s\n> ", whisper->sender_, message);
+        struct BodyWhisper *w = (struct BodyWhisper *)body;
+        char *msg = body + sizeof(struct BodyWhisper);
+        printf("\n[Whisper from %s] %s\n> ", w->sender_, msg);
         fflush(stdout);
       }
       break;
-    }
-
+    case PROTOCOL_ACTION_FILE_START:
+      if (body) handleFileStart((struct BodyFileStart *)body);
+      break;
+    case PROTOCOL_ACTION_FILE_DATA:
+      if (body) {
+        int data_len = header.body_length_ - sizeof(struct BodyFileData);
+        handleFileData((struct BodyFileData *)body, data_len);
+      }
+      break;
     default:
       break;
     }
@@ -166,145 +300,99 @@ void *receiveThread(void *arg) {
       body = NULL;
     }
   }
-
   return NULL;
 }
 
-// 정확히 length 바이트만큼 수신
-int recvAll(int sock, void *buffer, int length) {
-  int totalReceived = 0;
-  char *ptr = (char *)buffer;
+void printHelp(void) {
+  printf("\n=== Commands ===\n");
+  printf("  /help              - Show this help\n");
+  printf("  /list              - List online users\n");
+  printf("  /w <name> <msg>    - Whisper to user\n");
+  printf("  /files             - List server files\n");
+  printf("  /upload <path>     - Upload file\n");
+  printf("  /download <file>   - Download file\n");
+  printf("  /quit              - Exit chat\n");
+  printf("  (Other text is sent as chat)\n\n");
+}
 
-  while (totalReceived < length) {
-    int received = recv(sock, ptr + totalReceived, length - totalReceived, 0);
-    if (received <= 0) {
-      return received;
-    }
-    totalReceived += received;
+int main(int argc, char *argv[]) {
+  if (argc != 3) {
+    printf("Usage: %s <IP> <Port>\n", argv[0]);
+    return 1;
   }
 
-  return totalReceived;
-}
+  signal(SIGPIPE, SIG_IGN);
+  mkdir(DOWNLOAD_DIR, 0755);
 
-// 정확히 length 바이트만큼 송신 (뮤텍스 보호)
-int sendAll(int sock, void *buffer, int length) {
-  pthread_mutex_lock(&sockMutex);
-
-  int totalSent = 0;
-  char *ptr = (char *)buffer;
-
-  while (totalSent < length) {
-    int sent = send(sock, ptr + totalSent, length - totalSent, 0);
-    if (sent <= 0) {
-      pthread_mutex_unlock(&sockMutex);
-      return sent;
-    }
-    totalSent += sent;
+  sock = socket(PF_INET, SOCK_STREAM, 0);
+  if (sock == -1) {
+    perror("socket");
+    return 1;
   }
 
-  pthread_mutex_unlock(&sockMutex);
-  return totalSent;
-}
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = inet_addr(argv[1]);
+  addr.sin_port = htons(atoi(argv[2]));
 
-// JOIN 패킷 전송
-void sendJoin(const char *username) {
-  int totalLen = sizeof(struct PacketHeader) + sizeof(struct BodyJoin);
-  char *packet = (char *)malloc(totalLen);
+  if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    perror("connect");
+    close(sock);
+    return 1;
+  }
 
-  // 헤더
-  struct PacketHeader *header = (struct PacketHeader *)packet;
-  header->action_ = PROTOCOL_ACTION_JOIN;
-  header->body_length_ = sizeof(struct BodyJoin);
+  printf("=== Connected to chat server ===\n");
+  printf("Enter username: ");
+  fgets(myUsername, NAME_LENGTH, stdin);
+  myUsername[strcspn(myUsername, "\n")] = '\0';
 
-  // 바디
-  struct BodyJoin *body =
-      (struct BodyJoin *)(packet + sizeof(struct PacketHeader));
-  strncpy(body->username_, username, NAME_LENGTH - 1);
-  body->username_[NAME_LENGTH - 1] = '\0';
+  sendJoin(myUsername);
 
-  sendAll(sock, packet, totalLen);
-  free(packet);
-}
+  pthread_t tid;
+  pthread_create(&tid, NULL, receiveThread, NULL);
+  pthread_detach(tid);
 
-// CHAT 패킷 전송
-void sendChat(const char *message) {
-  int msgLen = strlen(message) + 1;
-  int totalLen = sizeof(struct PacketHeader) + sizeof(struct BodyChat) + msgLen;
+  printHelp();
 
-  char *packet = (char *)malloc(totalLen);
+  char input[BUF_SIZE];
+  while (1) {
+    printf("> ");
+    fflush(stdout);
+    if (!fgets(input, BUF_SIZE, stdin)) break;
+    input[strcspn(input, "\n")] = '\0';
+    if (strlen(input) == 0) continue;
 
-  // 헤더
-  struct PacketHeader *header = (struct PacketHeader *)packet;
-  header->action_ = PROTOCOL_ACTION_CHAT;
-  header->body_length_ = sizeof(struct BodyChat) + msgLen;
+    if (strcmp(input, "/quit") == 0) {
+      sendQuit();
+      break;
+    } else if (strcmp(input, "/help") == 0) {
+      printHelp();
+    } else if (strcmp(input, "/list") == 0) {
+      sendListOnline();
+    } else if (strcmp(input, "/files") == 0) {
+      sendListFile();
+    } else if (strncmp(input, "/upload ", 8) == 0) {
+      char *path = input + 8;
+      while (*path == ' ') path++;
+      if (*path) sendFileUpload(path);
+      else printf("Usage: /upload <filepath>\n");
+    } else if (strncmp(input, "/download ", 10) == 0) {
+      char *name = input + 10;
+      while (*name == ' ') name++;
+      if (*name) sendFileRequest(name);
+      else printf("Usage: /download <filename>\n");
+    } else if (strncmp(input, "/w ", 3) == 0) {
+      char *target = strtok(input + 3, " ");
+      char *msg = strtok(NULL, "");
+      if (target && msg) sendWhisper(target, msg);
+      else printf("Usage: /w <username> <message>\n");
+    } else {
+      sendChat(input);
+    }
+  }
 
-  // 바디
-  struct BodyChat *body =
-      (struct BodyChat *)(packet + sizeof(struct PacketHeader));
-  strncpy(body->sender_, myUsername, NAME_LENGTH - 1);
-  body->sender_[NAME_LENGTH - 1] = '\0';
-
-  // 메시지
-  strcpy(packet + sizeof(struct PacketHeader) + sizeof(struct BodyChat),
-         message);
-
-  sendAll(sock, packet, totalLen);
-  free(packet);
-}
-
-// WHISPER 패킷 전송
-void sendWhisper(const char *target, const char *message) {
-  int msgLen = strlen(message) + 1;
-  int totalLen =
-      sizeof(struct PacketHeader) + sizeof(struct BodyWhisper) + msgLen;
-
-  char *packet = (char *)malloc(totalLen);
-
-  // 헤더
-  struct PacketHeader *header = (struct PacketHeader *)packet;
-  header->action_ = PROTOCOL_ACTION_WHISPER;
-  header->body_length_ = sizeof(struct BodyWhisper) + msgLen;
-
-  // 바디
-  struct BodyWhisper *body =
-      (struct BodyWhisper *)(packet + sizeof(struct PacketHeader));
-  strncpy(body->sender_, myUsername, NAME_LENGTH - 1);
-  body->sender_[NAME_LENGTH - 1] = '\0';
-  strncpy(body->target_, target, NAME_LENGTH - 1);
-  body->target_[NAME_LENGTH - 1] = '\0';
-
-  // 메시지
-  strcpy(packet + sizeof(struct PacketHeader) + sizeof(struct BodyWhisper),
-         message);
-
-  sendAll(sock, packet, totalLen);
-  free(packet);
-}
-
-// LIST_ONLINE 패킷 전송
-void sendListOnline() {
-  struct PacketHeader header;
-  header.action_ = PROTOCOL_ACTION_LIST_ONLINE;
-  header.body_length_ = 0;
-
-  sendAll(sock, &header, sizeof(struct PacketHeader));
-}
-
-// QUIT 패킷 전송
-void sendQuit() {
-  struct PacketHeader header;
-  header.action_ = PROTOCOL_ACTION_QUIT;
-  header.body_length_ = 0;
-
-  sendAll(sock, &header, sizeof(struct PacketHeader));
-}
-
-// 도움말 출력
-void printHelp() {
-  printf("\n=== 명령어 목록 ===\n");
-  printf("  /help              - 이 도움말 표시\n");
-  printf("  /list              - 현재 접속자 목록 보기\n");
-  printf("  /w <name> <msg>    - 특정 사용자에게 귓속말\n");
-  printf("  /quit              - 채팅 종료\n");
-  printf("  (명령어가 아닌 일반 텍스트는 모두에게 전송됩니다)\n\n");
+  close(sock);
+  printf("Disconnected\n");
+  return 0;
 }
