@@ -1,6 +1,8 @@
+#include <ao/ao.h>
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <libgen.h>
+#include <mpg123.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -9,37 +11,25 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vlc/vlc.h>
 
-#include "client.h"
+#include "client_v2.h"
 
 int sock;
 char myUsername[NAME_LENGTH];
 pthread_mutex_t sockMutex = PTHREAD_MUTEX_INITIALIZER;
 DownloadSession downloadSession = {0};
 pthread_mutex_t downloadMutex = PTHREAD_MUTEX_INITIALIZER;
-
-// WSL 환경인지 확인
-int isWSL(void) {
-  FILE *fp = fopen("/proc/version", "r");
-  if (!fp) return 0;
-  
-  char buf[256];
-  int wsl = 0;
-  if (fgets(buf, sizeof(buf), fp)) {
-    // 소문자로 변환하여 비교
-    for (int i = 0; buf[i]; i++) {
-      buf[i] = tolower(buf[i]);
-    }
-    if (strstr(buf, "microsoft") != NULL) {
-      wsl = 1;
-    }
-  }
-  fclose(fp);
-  return wsl;
-}
+MediaPlayer mediaPlayer = {0};
+pthread_mutex_t mediaMutex = PTHREAD_MUTEX_INITIALIZER;
 
 // mp3/mp4 확장자인지 확인
 int isMediaFile(const char *filename) {
+  return isMP3File(filename) || isMP4File(filename);
+}
+
+// mp3 확장자인지 확인
+int isMP3File(const char *filename) {
   const char *dot = strrchr(filename, '.');
   if (!dot) return 0;
   
@@ -47,50 +37,275 @@ int isMediaFile(const char *filename) {
   strncpy(ext, dot + 1, sizeof(ext) - 1);
   ext[sizeof(ext) - 1] = '\0';
   
-  // 소문자로 변환
   for (int i = 0; ext[i]; i++) {
     ext[i] = tolower(ext[i]);
   }
   
-  return (strcmp(ext, "mp3") == 0 || strcmp(ext, "mp4") == 0);
+  return (strcmp(ext, "mp3") == 0);
 }
 
-// 미디어 플레이어로 파일 열기
-void openMediaPlayer(const char *filepath) {
-  char cmd[1024];
+// mp4 확장자인지 확인
+int isMP4File(const char *filename) {
+  const char *dot = strrchr(filename, '.');
+  if (!dot) return 0;
   
-  if (isWSL()) {
-    // WSL: wslpath로 Windows 경로 변환 후 PowerShell로 실행
-    char wslpath_cmd[512];
-    snprintf(wslpath_cmd, sizeof(wslpath_cmd), "wslpath -w \"%s\"", filepath);
-    
-    FILE *fp = popen(wslpath_cmd, "r");
-    if (!fp) {
-      printf("Failed to convert path\n");
-      return;
-    }
-    
-    char win_path[512];
-    if (!fgets(win_path, sizeof(win_path), fp)) {
-      pclose(fp);
-      printf("Failed to get Windows path\n");
-      return;
-    }
-    pclose(fp);
-    
-    // 개행 제거
-    win_path[strcspn(win_path, "\n")] = '\0';
-    
-    // PowerShell로 파일 열기 (백그라운드 실행)
-    snprintf(cmd, sizeof(cmd), 
-      "powershell.exe -Command \"Start-Process '%s'\" > /dev/null 2>&1 &", win_path);
-  } else {
-    // Native Linux: xdg-open 사용
-    snprintf(cmd, sizeof(cmd), "xdg-open \"%s\" > /dev/null 2>&1 &", filepath);
+  char ext[16];
+  strncpy(ext, dot + 1, sizeof(ext) - 1);
+  ext[sizeof(ext) - 1] = '\0';
+  
+  for (int i = 0; ext[i]; i++) {
+    ext[i] = tolower(ext[i]);
   }
   
-  system(cmd);
-  printf("Opening media player...\n");
+  return (strcmp(ext, "mp4") == 0);
+}
+
+// MP3 재생 스레드
+void *playMP3Thread(void *arg) {
+  char *filepath = (char *)arg;
+  mpg123_handle *mh = NULL;
+  ao_device *dev = NULL;
+  int err;
+  
+  // mpg123 초기화
+  mpg123_init();
+  mh = mpg123_new(NULL, &err);
+  if (!mh) {
+    printf("\n[Error] Failed to create mpg123 handle\n> ");
+    fflush(stdout);
+    goto cleanup;
+  }
+  
+  if (mpg123_open(mh, filepath) != MPG123_OK) {
+    printf("\n[Error] Cannot open file: %s\n> ", filepath);
+    fflush(stdout);
+    goto cleanup;
+  }
+  
+  // 오디오 포맷 가져오기
+  long rate;
+  int channels, encoding;
+  if (mpg123_getformat(mh, &rate, &channels, &encoding) != MPG123_OK) {
+    printf("\n[Error] Cannot get audio format\n> ");
+    fflush(stdout);
+    goto cleanup;
+  }
+  
+  // 포맷 고정
+  mpg123_format_none(mh);
+  mpg123_format(mh, rate, channels, encoding);
+  
+  // ao 초기화
+  ao_initialize();
+  
+  ao_sample_format format;
+  memset(&format, 0, sizeof(format));
+  format.bits = mpg123_encsize(encoding) * 8;
+  format.rate = rate;
+  format.channels = channels;
+  format.byte_format = AO_FMT_NATIVE;
+  
+  int driver = ao_default_driver_id();
+  dev = ao_open_live(driver, &format, NULL);
+  if (!dev) {
+    printf("\n[Error] Cannot open audio device\n> ");
+    fflush(stdout);
+    goto cleanup;
+  }
+  
+  // 재생 시작 메시지
+  pthread_mutex_lock(&mediaMutex);
+  mediaPlayer.playing = 1;
+  pthread_mutex_unlock(&mediaMutex);
+  
+  printf("\n[Playing] %s\n> ", mediaPlayer.filename);
+  fflush(stdout);
+  
+  // 재생 루프
+  size_t buffer_size = mpg123_outblock(mh);
+  unsigned char *buffer = malloc(buffer_size);
+  size_t done;
+  
+  while (1) {
+    pthread_mutex_lock(&mediaMutex);
+    int should_stop = mediaPlayer.stop_requested;
+    pthread_mutex_unlock(&mediaMutex);
+    
+    if (should_stop) break;
+    
+    int result = mpg123_read(mh, buffer, buffer_size, &done);
+    if (result == MPG123_DONE || done == 0) break;
+    if (result != MPG123_OK && result != MPG123_NEW_FORMAT) break;
+    
+    ao_play(dev, (char *)buffer, done);
+  }
+  
+  free(buffer);
+  
+cleanup:
+  if (dev) ao_close(dev);
+  if (mh) {
+    mpg123_close(mh);
+    mpg123_delete(mh);
+  }
+  mpg123_exit();
+  ao_shutdown();
+  
+  pthread_mutex_lock(&mediaMutex);
+  int was_stopped = mediaPlayer.stop_requested;
+  mediaPlayer.playing = 0;
+  mediaPlayer.stop_requested = 0;
+  mediaPlayer.filename[0] = '\0';
+  pthread_mutex_unlock(&mediaMutex);
+  
+  if (was_stopped) {
+    printf("\n[Stopped]\n> ");
+  } else {
+    printf("\n[Finished] Playback complete\n> ");
+  }
+  fflush(stdout);
+  
+  free(filepath);
+  return NULL;
+}
+
+// MP4 재생 스레드
+void *playMP4Thread(void *arg) {
+  char *filepath = (char *)arg;
+  
+  libvlc_instance_t *inst = libvlc_new(0, NULL);
+  if (!inst) {
+    printf("\n[Error] Failed to create VLC instance\n> ");
+    fflush(stdout);
+    free(filepath);
+    return NULL;
+  }
+  
+  libvlc_media_t *media = libvlc_media_new_path(inst, filepath);
+  if (!media) {
+    printf("\n[Error] Cannot open file: %s\n> ", filepath);
+    fflush(stdout);
+    libvlc_release(inst);
+    free(filepath);
+    return NULL;
+  }
+  
+  libvlc_media_player_t *mp = libvlc_media_player_new_from_media(media);
+  libvlc_media_release(media);
+  
+  if (!mp) {
+    printf("\n[Error] Failed to create media player\n> ");
+    fflush(stdout);
+    libvlc_release(inst);
+    free(filepath);
+    return NULL;
+  }
+  
+  // VLC 인스턴스 저장
+  pthread_mutex_lock(&mediaMutex);
+  mediaPlayer.vlc_inst = inst;
+  mediaPlayer.vlc_player = mp;
+  mediaPlayer.playing = 1;
+  pthread_mutex_unlock(&mediaMutex);
+  
+  printf("\n[Playing] %s (VLC window)\n> ", mediaPlayer.filename);
+  fflush(stdout);
+  
+  // 재생 시작
+  libvlc_media_player_play(mp);
+  
+  // 재생 완료 또는 stop 요청까지 대기
+  while (1) {
+    pthread_mutex_lock(&mediaMutex);
+    int should_stop = mediaPlayer.stop_requested;
+    pthread_mutex_unlock(&mediaMutex);
+    
+    if (should_stop) break;
+    
+    libvlc_state_t state = libvlc_media_player_get_state(mp);
+    if (state == libvlc_Ended || state == libvlc_Error || state == libvlc_Stopped) {
+      break;
+    }
+    
+    usleep(100000);  // 100ms
+  }
+  
+  // 정리
+  libvlc_media_player_stop(mp);
+  libvlc_media_player_release(mp);
+  libvlc_release(inst);
+  
+  pthread_mutex_lock(&mediaMutex);
+  int was_stopped = mediaPlayer.stop_requested;
+  mediaPlayer.playing = 0;
+  mediaPlayer.stop_requested = 0;
+  mediaPlayer.vlc_inst = NULL;
+  mediaPlayer.vlc_player = NULL;
+  mediaPlayer.filename[0] = '\0';
+  pthread_mutex_unlock(&mediaMutex);
+  
+  if (was_stopped) {
+    printf("\n[Stopped]\n> ");
+  } else {
+    printf("\n[Finished] Playback complete\n> ");
+  }
+  fflush(stdout);
+  
+  free(filepath);
+  return NULL;
+}
+
+// 미디어 재생 시작
+void playMedia(const char *filepath) {
+  pthread_mutex_lock(&mediaMutex);
+  if (mediaPlayer.playing) {
+    pthread_mutex_unlock(&mediaMutex);
+    printf("Already playing. Use /stop first.\n");
+    return;
+  }
+  
+  // 파일명 저장
+  const char *filename = strrchr(filepath, '/');
+  if (filename) filename++;
+  else filename = filepath;
+  strncpy(mediaPlayer.filename, filename, FILE_NAME_LENGTH - 1);
+  mediaPlayer.filename[FILE_NAME_LENGTH - 1] = '\0';
+  
+  mediaPlayer.stop_requested = 0;
+  pthread_mutex_unlock(&mediaMutex);
+  
+  // filepath 복사 (스레드에서 사용)
+  char *path_copy = strdup(filepath);
+  
+  if (isMP3File(filepath)) {
+    pthread_create(&mediaPlayer.thread, NULL, playMP3Thread, path_copy);
+    pthread_detach(mediaPlayer.thread);
+  } else if (isMP4File(filepath)) {
+    pthread_create(&mediaPlayer.thread, NULL, playMP4Thread, path_copy);
+    pthread_detach(mediaPlayer.thread);
+  } else {
+    free(path_copy);
+    printf("Unsupported format\n");
+  }
+}
+
+// 미디어 재생 중단
+void stopMedia(void) {
+  pthread_mutex_lock(&mediaMutex);
+  if (!mediaPlayer.playing) {
+    pthread_mutex_unlock(&mediaMutex);
+    printf("Nothing is playing.\n");
+    return;
+  }
+  
+  mediaPlayer.stop_requested = 1;
+  
+  // VLC인 경우 즉시 중단
+  if (mediaPlayer.vlc_player) {
+    libvlc_media_player_stop((libvlc_media_player_t *)mediaPlayer.vlc_player);
+  }
+  
+  pthread_mutex_unlock(&mediaMutex);
 }
 
 int recvAll(int sock, void *buffer, int length) {
@@ -249,14 +464,14 @@ void sendFileUpload(const char *filepath) {
   printf("Upload sent: %s (%lld bytes)\n", filename, total_sent);
 }
 
-void sendFileRequest(const char *filename, int open_flag) {
+void sendFileRequest(const char *filename, int play_flag) {
   pthread_mutex_lock(&downloadMutex);
   if (downloadSession.active) {
     pthread_mutex_unlock(&downloadMutex);
     printf("Download already in progress\n");
     return;
   }
-  downloadSession.open_after_download = open_flag;
+  downloadSession.play_after_download = play_flag;
   pthread_mutex_unlock(&downloadMutex);
 
   int len = sizeof(struct PacketHeader) + sizeof(struct BodyRequestFile);
@@ -318,12 +533,12 @@ void handleFileData(struct BodyFileData *body, int data_len) {
            downloadSession.filename, downloadSession.received);
     fflush(stdout);
     
-    // 미디어 파일이고 open_after_download 플래그가 설정된 경우 미디어 플레이어 실행
-    if (downloadSession.open_after_download) {
+    // 미디어 재생 플래그가 설정된 경우 재생 시작
+    if (downloadSession.play_after_download) {
       char filepath[512];
       snprintf(filepath, sizeof(filepath), "%s%s", DOWNLOAD_DIR, downloadSession.filename);
-      openMediaPlayer(filepath);
-      downloadSession.open_after_download = 0;
+      playMedia(filepath);
+      downloadSession.play_after_download = 0;
     }
     
     downloadSession.active = 0;
@@ -398,6 +613,7 @@ void printHelp(void) {
   printf("  /upload <path>     - Upload file\n");
   printf("  /download <file>   - Download file\n");
   printf("  /play <file>       - Download & play media (mp3/mp4)\n");
+  printf("  /stop              - Stop current playback\n");
   printf("  /quit              - Exit chat\n");
   printf("  (Other text is sent as chat)\n\n");
 }
@@ -429,7 +645,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  printf("=== Connected to chat server ===\n");
+  printf("=== Connected to chat server (V2 - Media Player) ===\n");
   printf("Enter username: ");
   fgets(myUsername, NAME_LENGTH, stdin);
   myUsername[strcspn(myUsername, "\n")] = '\0';
@@ -451,6 +667,7 @@ int main(int argc, char *argv[]) {
     if (strlen(input) == 0) continue;
 
     if (strcmp(input, "/quit") == 0) {
+      stopMedia();  // 재생 중이면 중단
       sendQuit();
       break;
     } else if (strcmp(input, "/help") == 0) {
@@ -481,6 +698,8 @@ int main(int argc, char *argv[]) {
       } else {
         printf("Usage: /play <filename.mp3|mp4>\n");
       }
+    } else if (strcmp(input, "/stop") == 0) {
+      stopMedia();
     } else if (strncmp(input, "/w ", 3) == 0) {
       char *target = strtok(input + 3, " ");
       char *msg = strtok(NULL, "");

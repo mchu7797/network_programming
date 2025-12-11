@@ -15,6 +15,7 @@ typedef struct {
   FILE *fp;
   long long total_size;
   long long received;
+  int open_after_download;  // 다운로드 완료 후 미디어 플레이어 실행 여부
 } DownloadSession;
 
 // 메시지 수신 스레드
@@ -34,7 +35,12 @@ void sendQuit();
 // 파일 관련 패킷 전송 함수
 void sendListFile();
 void sendFileUpload(const char *filepath);
-void sendFileRequest(const char *filename);
+void sendFileRequest(const char *filename, int open_flag);
+
+// 미디어 파일 관련 함수
+int isWSL(void);
+int isMediaFile(const char *filename);
+void openMediaPlayer(const char *filepath);
 
 // 파일 수신 처리 함수
 void handleFileStart(struct BodyFileStart *body);
